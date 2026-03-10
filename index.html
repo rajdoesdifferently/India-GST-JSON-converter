@@ -487,6 +487,41 @@
 const files = new Map(); // name -> { parsed, uploadedAt }
 let allRows  = [];       // flat invoice rows for table view
 
+// ─── Normalize b2b + cdnr into a unified entry list ──────────────────────────
+// Each entry: { ctin, error_cd, error_msg, section, docs[] }
+// Each doc:   { inum, idt, inv_typ, pos, rchrg, val, itms[] }
+function getEntries(parsed) {
+  const er = parsed?.error_report || {};
+  const entries = [];
+
+  // B2B – outward invoices
+  (er.b2b || []).forEach(e => {
+    entries.push({
+      ctin: e.ctin, error_cd: e.error_cd, error_msg: e.error_msg,
+      section: 'B2B',
+      docs: (e.inv || []).map(inv => ({
+        inum: inv.inum, idt: inv.idt, inv_typ: inv.inv_typ,
+        pos: inv.pos, rchrg: inv.rchrg, val: inv.val, itms: inv.itms || []
+      }))
+    });
+  });
+
+  // CDNR – credit / debit notes
+  (er.cdnr || []).forEach(e => {
+    entries.push({
+      ctin: e.ctin, error_cd: e.error_cd, error_msg: e.error_msg,
+      section: 'CDNR',
+      docs: (e.nt || []).map(nt => ({
+        inum: nt.nt_num, idt: nt.nt_dt,
+        inv_typ: nt.ntty === 'C' ? 'Credit Note' : nt.ntty === 'D' ? 'Debit Note' : (nt.ntty || ''),
+        pos: nt.pos, rchrg: nt.rchrg, val: nt.val, itms: nt.itms || []
+      }))
+    });
+  });
+
+  return entries;
+}
+
 // ─── Drop / Upload ────────────────────────────────────────────────────────────
 const dropZone  = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -535,16 +570,17 @@ function renderQueue() {
   if (files.size === 0) { q.innerHTML = '<div class="empty-state">No files loaded yet</div>'; return; }
   q.innerHTML = '';
   files.forEach((data, name) => {
-    const b2b      = data.parsed?.error_report?.b2b || [];
-    const invCount = b2b.reduce((a, c) => a + (c.inv?.length || 0), 0);
+    const entries  = getEntries(data.parsed);
+    const docCount = entries.reduce((a, e) => a + e.docs.length, 0);
     const fp       = data.parsed?.fp || '—';
+    const sections = [...new Set(entries.map(e => e.section))].join('+') || '—';
     const div = document.createElement('div');
     div.className = 'file-item';
     div.id = 'fi_' + sanitize(name);
     div.innerHTML = `
       <div class="fi-info">
         <div class="fi-name">${name}</div>
-        <div class="fi-meta">FP: ${fpFmt(fp)} · ${b2b.length} receivers · ${invCount} invoices</div>
+        <div class="fi-meta">FP: ${fpFmt(fp)} · ${entries.length} receivers · ${docCount} docs · ${sections}</div>
         <div class="fi-time">Uploaded ${tsShort(data.uploadedAt)}</div>
       </div>
       <span class="fi-badge" id="badge_${sanitize(name)}">Ready</span>
@@ -568,27 +604,27 @@ function renderMetrics() {
   const errorMap  = {}; // error_cd -> { msg, gstins:Set, invoices, byRate:{ rt -> {txval,camt,samt,igst} } }
 
   files.forEach(({ parsed }) => {
-    const b2b = parsed?.error_report?.b2b || [];
+    const entries = getEntries(parsed);
     if (parsed.gstin)    gstins.add(parsed.gstin);
     if (parsed.fp)       periods.add(fpFmt(parsed.fp));
     if (parsed.form_typ) formTypes.add(parsed.form_typ);
 
-    b2b.forEach(entry => {
+    entries.forEach(entry => {
       const cd = entry.error_cd;
       if (!errorMap[cd]) errorMap[cd] = { msg: entry.error_msg, gstins: new Set(), invoices: 0, byRate: {} };
       const eg = errorMap[cd];
       eg.gstins.add(entry.ctin);
 
-      (entry.inv || []).forEach(inv => {
+      entry.docs.forEach(doc => {
         eg.invoices++;
-        (inv.itms || []).forEach(itm => {
+        (doc.itms || []).forEach(itm => {
           const d  = itm.itm_det || {};
           const rt = d.rt;
           if (!eg.byRate[rt]) eg.byRate[rt] = { txval: 0, camt: 0, samt: 0, igst: 0 };
-          eg.byRate[rt].txval += d.txval  || 0;
-          eg.byRate[rt].camt  += d.camt   || 0;
-          eg.byRate[rt].samt  += d.samt   || 0;
-          eg.byRate[rt].igst  += d.igst   || 0;
+          eg.byRate[rt].txval += d.txval || 0;
+          eg.byRate[rt].camt  += d.camt  || 0;
+          eg.byRate[rt].samt  += d.samt  || 0;
+          eg.byRate[rt].igst  += d.iamt  || 0;
         });
       });
     });
@@ -596,14 +632,15 @@ function renderMetrics() {
 
   // ── Files metadata rows ──
   const fileRows = [...files.entries()].map(([name, data]) => {
-    const b2b = data.parsed?.error_report?.b2b || [];
-    const inv = b2b.reduce((a, c) => a + (c.inv?.length || 0), 0);
+    const entries  = getEntries(data.parsed);
+    const docCount = entries.reduce((a, e) => a + e.docs.length, 0);
+    const sections = [...new Set(entries.map(e => e.section))].join('+') || '—';
     return `
       <div class="fml-row">
         <div class="fml-icon">📄</div>
         <div class="fml-info">
           <div class="fml-name">${name}</div>
-          <div class="fml-sub">FP: ${fpFmt(data.parsed?.fp)} · ${b2b.length} receivers · ${inv} invoices</div>
+          <div class="fml-sub">FP: ${fpFmt(data.parsed?.fp)} · ${entries.length} receivers · ${docCount} docs · ${sections}</div>
         </div>
         <div class="fml-time">${tsDate(data.uploadedAt)}<span>${tsTime(data.uploadedAt)}</span></div>
       </div>`;
@@ -724,17 +761,16 @@ function convertAll() {
 }
 
 function collectRows(parsed) {
-  const b2b = parsed?.error_report?.b2b || [];
-  b2b.forEach(entry => {
-    (entry.inv || []).forEach(inv => {
-      (inv.itms || []).forEach(itm => {
+  getEntries(parsed).forEach(entry => {
+    entry.docs.forEach(doc => {
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         allRows.push({
-          ctin: entry.ctin, inum: inv.inum, idt: inv.idt,
+          ctin: entry.ctin, inum: doc.inum, idt: doc.idt,
           rt: d.rt,
           txval: r2(d.txval), camt: r2(d.camt), samt: r2(d.samt),
-          igst: r2(d.igst || 0), csamt: r2(d.csamt || 0),
-          val: r2(inv.val), error_cd: entry.error_cd
+          igst: r2(d.iamt || 0), csamt: r2(d.csamt || 0),
+          val: r2(doc.val), error_cd: entry.error_cd
         });
       });
     });
@@ -750,9 +786,10 @@ function addDownload(name, url, parsed, isConsolidated) {
   if (isConsolidated) {
     meta = `${files.size} file${files.size !== 1 ? 's' : ''} · ${allRows.length} line items · All periods`;
   } else {
-    const b2b  = parsed?.error_report?.b2b || [];
-    const invC = b2b.reduce((a, c) => a + (c.inv?.length || 0), 0);
-    meta = `${invC} invoices · FP ${fpFmt(parsed.fp)}`;
+    const entries  = getEntries(parsed);
+    const docCount = entries.reduce((a, e) => a + e.docs.length, 0);
+    const sections = [...new Set(entries.map(e => e.section))].join('+') || '—';
+    meta = `${docCount} docs · ${sections} · FP ${fpFmt(parsed.fp)}`;
   }
 
   const viewBtn = isConsolidated
@@ -771,14 +808,14 @@ function addDownload(name, url, parsed, isConsolidated) {
 function buildConsolidatedWorkbook(allParsed) {
   const wb = XLSX.utils.book_new();
 
-  // Merge all b2b across files
-  const allB2B   = [];
+  // Merge all entries across files
+  const allEntries = [];
   const gstins   = new Set();
   const periods  = new Set();
   allParsed.forEach(p => {
     if (p.gstin) gstins.add(p.gstin);
     if (p.fp)    periods.add(fpFmt(p.fp));
-    (p.error_report?.b2b || []).forEach(e => allB2B.push(e));
+    getEntries(p).forEach(e => allEntries.push(e));
   });
 
   // Sheet 1 – Consolidated Summary
@@ -793,20 +830,20 @@ function buildConsolidatedWorkbook(allParsed) {
   ];
 
   const eg = {};
-  allB2B.forEach(e => {
+  allEntries.forEach(e => {
     const cd = e.error_cd;
     if (!eg[cd]) eg[cd] = { msg: e.error_msg, gstins: new Set(), invoices: 0, byRate: {} };
     eg[cd].gstins.add(e.ctin);
-    (e.inv || []).forEach(inv => {
+    e.docs.forEach(doc => {
       eg[cd].invoices++;
-      (inv.itms || []).forEach(itm => {
+      (doc.itms || []).forEach(itm => {
         const d  = itm.itm_det || {};
         const rt = d.rt;
         if (!eg[cd].byRate[rt]) eg[cd].byRate[rt] = { txval:0, camt:0, samt:0, igst:0 };
         eg[cd].byRate[rt].txval += d.txval || 0;
         eg[cd].byRate[rt].camt  += d.camt  || 0;
         eg[cd].byRate[rt].samt  += d.samt  || 0;
-        eg[cd].byRate[rt].igst  += d.igst  || 0;
+        eg[cd].byRate[rt].igst  += d.iamt  || 0;
       });
     });
   });
@@ -826,36 +863,36 @@ function buildConsolidatedWorkbook(allParsed) {
   XLSX.utils.book_append_sheet(wb, ws1, 'Summary');
 
   // Sheet 2 – All Invoices
-  const hdr = ['Sr','Receiver GSTIN','Invoice No.','Date','Inv Type','POS','Rev Chg','Invoice Value ₹','Rate %','Taxable Value ₹','CGST ₹','SGST ₹','IGST ₹','Cess ₹','Error Code','Error Message'];
+  const hdr = ['Sr','Section','Receiver GSTIN','Doc No.','Date','Doc Type','POS','Rev Chg','Invoice Value ₹','Rate %','Taxable Value ₹','CGST ₹','SGST ₹','IGST ₹','Cess ₹','Error Code','Error Message'];
   const invRows = [hdr]; let sr = 1;
-  allB2B.forEach(e => {
-    (e.inv || []).forEach(inv => {
-      (inv.itms || []).forEach(itm => {
+  allEntries.forEach(e => {
+    e.docs.forEach(doc => {
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         invRows.push([
-          sr++, e.ctin, inv.inum, inv.idt, inv.inv_typ, inv.pos, inv.rchrg,
-          r2(inv.val), d.rt, r2(d.txval), r2(d.camt), r2(d.samt),
-          r2(d.igst || 0), r2(d.csamt || 0), e.error_cd, e.error_msg
+          sr++, e.section, e.ctin, doc.inum, doc.idt, doc.inv_typ, doc.pos, doc.rchrg,
+          r2(doc.val), d.rt, r2(d.txval), r2(d.camt), r2(d.samt),
+          r2(d.iamt || 0), r2(d.csamt || 0), e.error_cd, e.error_msg
         ]);
       });
     });
   });
   const ws2 = XLSX.utils.aoa_to_sheet(invRows);
-  ws2['!cols'] = [6,20,16,12,8,8,8,16,8,16,12,12,12,10,14,36].map(w => ({ wch: w }));
+  ws2['!cols'] = [6,8,20,16,12,14,8,8,16,8,16,12,12,12,10,14,36].map(w => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, ws2, 'All Invoices');
 
   // Sheet 3 – GSTIN Wise
   const gs = {};
-  allB2B.forEach(e => {
+  allEntries.forEach(e => {
     if (!gs[e.ctin]) gs[e.ctin] = { n:0, v:0, t:0, c:0, s:0, ig:0 };
-    (e.inv || []).forEach(inv => {
-      gs[e.ctin].n++; gs[e.ctin].v += inv.val || 0;
-      (inv.itms || []).forEach(itm => {
+    e.docs.forEach(doc => {
+      gs[e.ctin].n++; gs[e.ctin].v += doc.val || 0;
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         gs[e.ctin].t  += d.txval || 0;
         gs[e.ctin].c  += d.camt  || 0;
         gs[e.ctin].s  += d.samt  || 0;
-        gs[e.ctin].ig += d.igst  || 0;
+        gs[e.ctin].ig += d.iamt  || 0;
       });
     });
   });
@@ -930,7 +967,7 @@ function renderTable(rows) {
 // ─── Excel Build ──────────────────────────────────────────────────────────────
 function buildWorkbook(parsed) {
   const wb  = XLSX.utils.book_new();
-  const b2b = parsed?.error_report?.b2b || [];
+  const entries = getEntries(parsed);
   const fp  = parsed?.fp || '';
   const gstin = parsed?.gstin || '';
 
@@ -948,20 +985,20 @@ function buildWorkbook(parsed) {
   ];
 
   const eg = {};
-  b2b.forEach(e => {
+  entries.forEach(e => {
     const cd = e.error_cd;
     if (!eg[cd]) eg[cd] = { msg: e.error_msg, gstins: new Set(), invoices: 0, byRate: {} };
     eg[cd].gstins.add(e.ctin);
-    (e.inv || []).forEach(inv => {
+    e.docs.forEach(doc => {
       eg[cd].invoices++;
-      (inv.itms || []).forEach(itm => {
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         const rt = d.rt;
         if (!eg[cd].byRate[rt]) eg[cd].byRate[rt] = { txval:0, camt:0, samt:0, igst:0 };
         eg[cd].byRate[rt].txval += d.txval || 0;
         eg[cd].byRate[rt].camt  += d.camt  || 0;
         eg[cd].byRate[rt].samt  += d.samt  || 0;
-        eg[cd].byRate[rt].igst  += d.igst  || 0;
+        eg[cd].byRate[rt].igst  += d.iamt  || 0;
       });
     });
   });
@@ -984,36 +1021,36 @@ function buildWorkbook(parsed) {
   XLSX.utils.book_append_sheet(wb, ws1, 'Summary');
 
   // Sheet 2 – Invoice Detail
-  const hdr = ['Sr','Receiver GSTIN','Invoice No.','Date','Inv Type','POS','Rev Chg','Invoice Value ₹','Rate %','Taxable Value ₹','CGST ₹','SGST ₹','IGST ₹','Cess ₹','Error Code','Error Message'];
+  const hdr = ['Sr','Section','Receiver GSTIN','Doc No.','Date','Doc Type','POS','Rev Chg','Invoice Value ₹','Rate %','Taxable Value ₹','CGST ₹','SGST ₹','IGST ₹','Cess ₹','Error Code','Error Message'];
   const rows2 = [hdr]; let sr = 1;
-  b2b.forEach(e => {
-    (e.inv || []).forEach(inv => {
-      (inv.itms || []).forEach(itm => {
+  entries.forEach(e => {
+    e.docs.forEach(doc => {
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         rows2.push([
-          sr++, e.ctin, inv.inum, inv.idt, inv.inv_typ, inv.pos, inv.rchrg,
-          r2(inv.val), d.rt, r2(d.txval), r2(d.camt), r2(d.samt),
-          r2(d.igst || 0), r2(d.csamt || 0), e.error_cd, e.error_msg
+          sr++, e.section, e.ctin, doc.inum, doc.idt, doc.inv_typ, doc.pos, doc.rchrg,
+          r2(doc.val), d.rt, r2(d.txval), r2(d.camt), r2(d.samt),
+          r2(d.iamt || 0), r2(d.csamt || 0), e.error_cd, e.error_msg
         ]);
       });
     });
   });
   const ws2 = XLSX.utils.aoa_to_sheet(rows2);
-  ws2['!cols'] = [6,20,16,12,8,8,8,16,8,16,12,12,12,10,14,36].map(w => ({ wch: w }));
+  ws2['!cols'] = [6,8,20,16,12,14,8,8,16,8,16,12,12,12,10,14,36].map(w => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, ws2, 'Invoice Detail');
 
   // Sheet 3 – GSTIN Wise
   const gs = {};
-  b2b.forEach(e => {
+  entries.forEach(e => {
     if (!gs[e.ctin]) gs[e.ctin] = { n:0, v:0, t:0, c:0, s:0, ig:0 };
-    (e.inv || []).forEach(inv => {
-      gs[e.ctin].n++; gs[e.ctin].v += inv.val || 0;
-      (inv.itms || []).forEach(itm => {
+    e.docs.forEach(doc => {
+      gs[e.ctin].n++; gs[e.ctin].v += doc.val || 0;
+      (doc.itms || []).forEach(itm => {
         const d = itm.itm_det || {};
         gs[e.ctin].t  += d.txval || 0;
         gs[e.ctin].c  += d.camt  || 0;
         gs[e.ctin].s  += d.samt  || 0;
-        gs[e.ctin].ig += d.igst  || 0;
+        gs[e.ctin].ig += d.iamt  || 0;
       });
     });
   });
